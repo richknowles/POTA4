@@ -13,10 +13,11 @@ require (
 	google.golang.org/protobuf v1.27.1 // indirect
 )
 
+require github.com/sirupsen/logrus v1.8.1
+
 require (
 	github.com/nats-io/nkeys v0.3.0 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
-	github.com/sirupsen/logrus v1.8.1 // indirect
 	golang.org/x/crypto v0.0.0-20210616213533-5ff15b29337e // indirect
 	golang.org/x/sys v0.0.0-20210615035016-665e8c7367d1 // indirect
 )
