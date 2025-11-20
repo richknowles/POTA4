@@ -50,4 +50,13 @@ docs/site/
 reset_db.sh
 run_go_cmd.py
 nats-api.conf
-
+ignore/
+coverage.lcov
+daphne.sock.lock
+.pytest_cache
+coverage.xml
+setup_dev.yml
+11env/
+query_schema.json
+gunicorn_config.py
+set_local_config.py

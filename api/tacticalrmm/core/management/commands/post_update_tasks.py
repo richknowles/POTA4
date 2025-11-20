@@ -1,20 +1,22 @@
 import base64
-from django.core.management.base import BaseCommand
-from django.utils.timezone import make_aware
-import datetime as dt
 
-from logs.models import PendingAction
-from scripts.models import Script
-from autotasks.models import AutomatedTask
+from django.core.management.base import BaseCommand
+
 from accounts.models import User
+from agents.models import Agent
+from autotasks.models import AutomatedTask
+from checks.models import Check, CheckHistory
+from core.models import CoreSettings
+from core.tasks import remove_orphaned_history_results, sync_mesh_perms_task
+from scripts.models import Script
+from tacticalrmm.constants import AGENT_DEFER, ScriptType
 
 
 class Command(BaseCommand):
     help = "Collection of tasks to run after updating the rmm, after migrations"
 
-    def handle(self, *args, **kwargs):
-        # remove task pending actions. deprecated 4/20/2021
-        PendingAction.objects.filter(action_type="taskaction").delete()
+    def handle(self, *args, **kwargs) -> None:
+        self.stdout.write("Running post update tasks")
 
         # load community scripts into the db
         Script.load_community_scripts()
@@ -26,7 +28,7 @@ class Command(BaseCommand):
                 user.save()
 
         # convert script base64 field to text field
-        user_scripts = Script.objects.exclude(script_type="builtin").filter(
+        user_scripts = Script.objects.exclude(script_type=ScriptType.BUILT_IN).filter(
             script_body=""
         )
         for script in user_scripts:
@@ -37,34 +39,39 @@ class Command(BaseCommand):
             # script.hash_script_body()  # also saves script
             script.save(update_fields=["script_body"])
 
-        # convert autotask to the new format
-        for task in AutomatedTask.objects.all():
-            try:
-                edited = False
+        # Remove policy checks and tasks on agents and check
+        AutomatedTask.objects.filter(managed_by_policy=True).delete()
+        Check.objects.filter(managed_by_policy=True).delete()
+        CheckHistory.objects.filter(agent_id=None).delete()
 
-                # convert scheduled task_type
-                if task.task_type == "scheduled":
-                    task.task_type = "daily"
-                    task.run_time_date = make_aware(
-                        dt.datetime.strptime(task.run_time_minute, "%H:%M")
-                    )
-                    task.daily_interval = 1
-                    edited = True
+        # set goarch for older windows agents
+        for agent in Agent.objects.defer(*AGENT_DEFER):
+            if not agent.goarch:
+                if agent.arch == "64":
+                    agent.goarch = "amd64"
+                elif agent.arch == "32":
+                    agent.goarch = "386"
+                else:
+                    agent.goarch = "amd64"
 
-                # convert actions
-                if not task.actions:
-                    task.actions = [
-                        {
-                            "type": "script",
-                            "script": task.script.pk,
-                            "script_args": task.script_args,
-                            "timeout": task.timeout,
-                            "name": task.script.name,
-                        }
-                    ]
-                    edited = True
+                agent.save(update_fields=["goarch"])
 
-                if edited:
-                    task.save()
-            except:
-                continue
+        self.stdout.write(
+            self.style.SUCCESS("Checking for orphaned history results...")
+        )
+        count = remove_orphaned_history_results()
+        if count:
+            self.stdout.write(
+                self.style.SUCCESS(f"Removed {count} orphaned history results.")
+            )
+
+        core = CoreSettings.objects.first()
+        if core.sync_mesh_with_trmm:
+            self.stdout.write(
+                self.style.SUCCESS(
+                    "Syncing trmm users/permissions with meshcentral, this might take a long time...please wait..."
+                )
+            )
+            sync_mesh_perms_task()
+
+        self.stdout.write("Post update tasks finished")

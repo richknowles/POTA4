@@ -1,30 +1,48 @@
-import requests
 import smtplib
+import traceback
+from contextlib import suppress
+from email.headerregistry import Address
 from email.message import EmailMessage
+from email.utils import formatdate
+from typing import TYPE_CHECKING, List, Optional, cast
 
-import pytz
+import requests
 from django.conf import settings
 from django.contrib.postgres.fields import ArrayField
+from django.core.cache import cache
 from django.core.exceptions import ValidationError
 from django.db import models
-from twilio.rest import Client as TwClient
 from twilio.base.exceptions import TwilioRestException
+from twilio.rest import Client as TwClient
 
-from logs.models import BaseAuditModel, DebugLog, LOG_LEVEL_CHOICES
+from logs.models import BaseAuditModel, DebugLog
+from tacticalrmm.constants import (
+    ALL_TIMEZONES,
+    CORESETTINGS_CACHE_KEY,
+    CustomFieldModel,
+    CustomFieldType,
+    DebugLogLevel,
+    MonthlyType,
+    ScheduleType,
+    URLActionRestMethod,
+    URLActionType,
+)
+from tacticalrmm.logger import logger
 
-TZ_CHOICES = [(_, _) for _ in pytz.all_timezones]
+if TYPE_CHECKING:
+    from alerts.models import AlertTemplate
+
+TZ_CHOICES = [(_, _) for _ in ALL_TIMEZONES]
 
 
 class CoreSettings(BaseAuditModel):
     email_alert_recipients = ArrayField(
         models.EmailField(null=True, blank=True),
-        null=True,
         blank=True,
         default=list,
     )
     sms_alert_recipients = ArrayField(
         models.CharField(max_length=255, null=True, blank=True),
-        null=True,
         blank=True,
         default=list,
     )
@@ -32,18 +50,17 @@ class CoreSettings(BaseAuditModel):
     twilio_account_sid = models.CharField(max_length=255, null=True, blank=True)
     twilio_auth_token = models.CharField(max_length=255, null=True, blank=True)
     smtp_from_email = models.CharField(
-        max_length=255, null=True, blank=True, default="from@example.com"
+        max_length=255, blank=True, default="from@example.com"
     )
-    smtp_host = models.CharField(
-        max_length=255, null=True, blank=True, default="smtp.gmail.com"
-    )
+    smtp_from_name = models.CharField(max_length=255, null=True, blank=True)
+    smtp_host = models.CharField(max_length=255, blank=True, default="smtp.gmail.com")
     smtp_host_user = models.CharField(
-        max_length=255, null=True, blank=True, default="admin@example.com"
+        max_length=255, blank=True, default="admin@example.com"
     )
     smtp_host_password = models.CharField(
-        max_length=255, null=True, blank=True, default="changeme"
+        max_length=255, blank=True, default="changeme"
     )
-    smtp_port = models.PositiveIntegerField(default=587, null=True, blank=True)
+    smtp_port = models.PositiveIntegerField(default=587, blank=True)
     smtp_requires_auth = models.BooleanField(default=True)
     default_time_zone = models.CharField(
         max_length=255, choices=TZ_CHOICES, default="America/Los_Angeles"
@@ -54,13 +71,19 @@ class CoreSettings(BaseAuditModel):
     agent_history_prune_days = models.PositiveIntegerField(default=60)
     debug_log_prune_days = models.PositiveIntegerField(default=30)
     audit_log_prune_days = models.PositiveIntegerField(default=0)
+    report_history_prune_days = models.PositiveIntegerField(default=0)
     agent_debug_level = models.CharField(
-        max_length=20, choices=LOG_LEVEL_CHOICES, default="info"
+        max_length=20, choices=DebugLogLevel.choices, default=DebugLogLevel.INFO
     )
     clear_faults_days = models.IntegerField(default=0)
     mesh_token = models.CharField(max_length=255, null=True, blank=True, default="")
     mesh_username = models.CharField(max_length=255, null=True, blank=True, default="")
     mesh_site = models.CharField(max_length=255, null=True, blank=True, default="")
+    mesh_device_group = models.CharField(
+        max_length=255, null=True, blank=True, default="TacticalRMM"
+    )
+    mesh_company_name = models.CharField(max_length=255, null=True, blank=True)
+    sync_mesh_with_trmm = models.BooleanField(default=True)
     agent_auto_update = models.BooleanField(default=True)
     workstation_policy = models.ForeignKey(
         "automation.Policy",
@@ -83,40 +106,83 @@ class CoreSettings(BaseAuditModel):
         null=True,
         blank=True,
     )
+    date_format = models.CharField(
+        max_length=30, blank=True, default="MMM-DD-YYYY - HH:mm"
+    )
+    open_ai_token = models.CharField(max_length=255, null=True, blank=True)
+    open_ai_model = models.CharField(
+        max_length=255, blank=True, default="gpt-3.5-turbo"
+    )
+    enable_server_scripts = models.BooleanField(default=True)
+    enable_server_webterminal = models.BooleanField(default=False)
+    notify_on_info_alerts = models.BooleanField(default=False)
+    notify_on_warning_alerts = models.BooleanField(default=True)
 
-    def save(self, *args, **kwargs):
+    block_local_user_logon = models.BooleanField(default=False)
+    sso_enabled = models.BooleanField(default=False)
+
+    def save(self, *args, **kwargs) -> None:
         from alerts.tasks import cache_agents_alert_template
-        from automation.tasks import generate_agent_checks_task
+
+        cache.delete(CORESETTINGS_CACHE_KEY)
 
         if not self.pk and CoreSettings.objects.exists():
             raise ValidationError("There can only be one CoreSettings instance")
 
         # for install script
         if not self.pk:
-            try:
+            with suppress(Exception):
                 self.mesh_site = settings.MESH_SITE
-                self.mesh_username = settings.MESH_USERNAME
+                self.mesh_username = settings.MESH_USERNAME.lower()
                 self.mesh_token = settings.MESH_TOKEN_KEY
-            except:
-                pass
 
         old_settings = type(self).objects.get(pk=self.pk) if self.pk else None
-        super(BaseAuditModel, self).save(*args, **kwargs)
 
-        # check if server polcies have changed and initiate task to reapply policies if so
-        if (old_settings and old_settings.server_policy != self.server_policy) or (
-            old_settings and old_settings.workstation_policy != self.workstation_policy
-        ):
-            generate_agent_checks_task.delay(all=True, create_tasks=True)
+        if old_settings:
+            # fail safe to not lock out user logons
+            if not self.sso_enabled and self.block_local_user_logon:
+                self.block_local_user_logon = False
 
-        if old_settings and old_settings.alert_template != self.alert_template:
-            cache_agents_alert_template.delay()
+            if old_settings.sso_enabled != self.sso_enabled and self.sso_enabled:
+                from core.utils import token_is_valid
 
-    def __str__(self):
+                _, valid = token_is_valid()
+                if not valid:
+                    raise ValidationError("")
+
+        super().save(*args, **kwargs)
+
+        if old_settings:
+
+            if (
+                old_settings.alert_template != self.alert_template
+                or old_settings.server_policy != self.server_policy
+                or old_settings.workstation_policy != self.workstation_policy
+            ):
+                cache_agents_alert_template.delay()
+
+            if old_settings.workstation_policy != self.workstation_policy:
+                cache.delete_many_pattern("site_workstation_*")
+
+            if old_settings.server_policy != self.server_policy:
+                cache.delete_many_pattern("site_server_*")
+
+            if (
+                old_settings.server_policy != self.server_policy
+                or old_settings.workstation_policy != self.workstation_policy
+            ):
+                cache.delete_many_pattern("agent_*")
+
+    def __str__(self) -> str:
         return "Global Site Settings"
 
     @property
-    def sms_is_configured(self):
+    def mesh_api_superuser(self) -> str:
+        # must be lowercase otherwise mesh api breaks
+        return self.mesh_username.lower()
+
+    @property
+    def sms_is_configured(self) -> bool:
         return all(
             [
                 self.twilio_auth_token,
@@ -126,7 +192,7 @@ class CoreSettings(BaseAuditModel):
         )
 
     @property
-    def email_is_configured(self):
+    def email_is_configured(self) -> bool:
         # smtp with username/password authentication
         if (
             self.smtp_requires_auth
@@ -148,12 +214,45 @@ class CoreSettings(BaseAuditModel):
 
         return False
 
-    def send_mail(self, subject, body, alert_template=None, test=False):
+    @property
+    def server_scripts_enabled(self) -> bool:
+        if (
+            getattr(settings, "HOSTED", False)
+            or getattr(settings, "TRMM_DISABLE_SERVER_SCRIPTS", False)
+            or getattr(settings, "DEMO", False)
+        ):
+            return False
+
+        return self.enable_server_scripts
+
+    @property
+    def web_terminal_enabled(self) -> bool:
+        if (
+            getattr(settings, "HOSTED", False)
+            or getattr(settings, "TRMM_DISABLE_WEB_TERMINAL", False)
+            or getattr(settings, "DEMO", False)
+        ):
+            return False
+
+        return self.enable_server_webterminal
+
+    def send_mail(
+        self,
+        subject: str,
+        body: str,
+        attachment: Optional[bytes] = None,
+        attachment_filename: Optional[str] = None,
+        attachment_type: Optional[str] = None,
+        attachment_extension: Optional[str] = None,
+        alert_template: "Optional[AlertTemplate]" = None,
+        override_recipients: Optional[List[str]] = [],
+        test: bool = False,
+    ) -> tuple[str, bool]:
         if test and not self.email_is_configured:
-            return "There needs to be at least one email recipient configured"
+            return "There needs to be at least one email recipient configured", False
         # return since email must be configured to continue
         elif not self.email_is_configured:
-            return False
+            return "SMTP messaging not configured.", False
 
         # override email from if alert_template is passed and is set
         if alert_template and alert_template.email_from:
@@ -162,52 +261,109 @@ class CoreSettings(BaseAuditModel):
             from_address = self.smtp_from_email
 
         # override email recipients if alert_template is passed and is set
-        if alert_template and alert_template.email_recipients:
+        if override_recipients:
+            email_recipients = ", ".join(override_recipients)
+        elif alert_template and alert_template.email_recipients:
             email_recipients = ", ".join(alert_template.email_recipients)
-        else:
+        elif self.email_alert_recipients:
             email_recipients = ", ".join(self.email_alert_recipients)
-
-        if not email_recipients:
-            return "There needs to be at least one email recipient configured"
+        else:
+            return "There needs to be at least one email recipient configured", False
 
         try:
             msg = EmailMessage()
+
             msg["Subject"] = subject
-            msg["From"] = from_address
+            msg["Date"] = formatdate(localtime=True)
+
+            if self.smtp_from_name:
+                msg["From"] = Address(
+                    display_name=self.smtp_from_name, addr_spec=from_address
+                )
+            else:
+                msg["From"] = from_address
+
             msg["To"] = email_recipients
             msg.set_content(body)
+
+            if attachment:
+                match attachment_type:
+                    case "pdf":
+                        subtype = "pdf"
+                        ext = "pdf"
+                    case "html":
+                        subtype = "html"
+                        ext = "html"
+                    case "plaintext":
+                        subtype = "plain"
+                        ext = attachment_extension or "txt"
+                    case _:
+                        subtype = "plain"
+                        ext = "txt"
+
+                if attachment_type == "pdf":
+                    msg.add_attachment(
+                        attachment,
+                        maintype="application",
+                        subtype=subtype,
+                        filename=f"{attachment_filename}.{ext}",
+                    )
+                elif attachment_type in ("html", "plaintext"):
+                    msg.add_attachment(
+                        attachment,
+                        subtype=subtype,
+                        filename=f"{attachment_filename}.{ext}",
+                    )
 
             with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=20) as server:
                 if self.smtp_requires_auth:
                     server.ehlo()
                     server.starttls()
-                    server.login(self.smtp_host_user, self.smtp_host_password)
+                    server.login(
+                        self.smtp_host_user,
+                        self.smtp_host_password,
+                    )
                     server.send_message(msg)
                     server.quit()
                 else:
-                    # smtp relay. no auth required
-                    server.send_message(msg)
-                    server.quit()
+                    # gmail smtp relay specific handling.
+                    if self.smtp_host == "smtp-relay.gmail.com":
+                        server.ehlo()
+                        server.starttls()
+                        server.send_message(msg)
+                        server.quit()
+                    else:
+                        # smtp relay. no auth required
+                        server.send_message(msg)
+                        server.quit()
 
         except Exception as e:
+            logger.error(traceback.format_exc())
             DebugLog.error(message=f"Sending email failed with error: {e}")
             if test:
-                return str(e)
-        else:
-            return True
+                return str(e), False
 
-    def send_sms(self, body, alert_template=None, test=False):
+        if test:
+            return "Email test ok!", True
+
+        return "ok", True
+
+    def send_sms(
+        self,
+        body: str,
+        alert_template: "Optional[AlertTemplate]" = None,
+        test: bool = False,
+    ) -> tuple[str, bool]:
         if not self.sms_is_configured:
-            return "Sms alerting is not setup correctly."
+            return "Sms alerting is not setup correctly.", False
 
         # override email recipients if alert_template is passed and is set
         if alert_template and alert_template.text_recipients:
             text_recipients = alert_template.text_recipients
+        elif self.sms_alert_recipients:
+            text_recipients = cast(List[str], self.sms_alert_recipients)
         else:
-            text_recipients = self.sms_alert_recipients
-
-        if not text_recipients:
-            return "No sms recipients found"
+            return "No sms recipients found", False
 
         tw_client = TwClient(self.twilio_account_sid, self.twilio_auth_token)
         for num in text_recipients:
@@ -216,9 +372,12 @@ class CoreSettings(BaseAuditModel):
             except TwilioRestException as e:
                 DebugLog.error(message=f"SMS failed to send: {e}")
                 if test:
-                    return str(e)
+                    return str(e), False
 
-        return True
+        if test:
+            return "SMS Test sent successfully!", True
+
+        return "ok", True
 
     @staticmethod
     def serialize(core):
@@ -228,30 +387,19 @@ class CoreSettings(BaseAuditModel):
         return CoreSerializer(core).data
 
 
-FIELD_TYPE_CHOICES = (
-    ("text", "Text"),
-    ("number", "Number"),
-    ("single", "Single"),
-    ("multiple", "Multiple"),
-    ("checkbox", "Checkbox"),
-    ("datetime", "DateTime"),
-)
-
-MODEL_CHOICES = (("client", "Client"), ("site", "Site"), ("agent", "Agent"))
-
-
 class CustomField(BaseAuditModel):
-
     order = models.PositiveIntegerField(default=0)
-    model = models.CharField(max_length=25, choices=MODEL_CHOICES)
-    type = models.CharField(max_length=25, choices=FIELD_TYPE_CHOICES, default="text")
+    model = models.CharField(max_length=25, choices=CustomFieldModel.choices)
+    type = models.CharField(
+        max_length=25, choices=CustomFieldType.choices, default=CustomFieldType.TEXT
+    )
     options = ArrayField(
         models.CharField(max_length=255, null=True, blank=True),
         null=True,
         blank=True,
         default=list,
     )
-    name = models.TextField(null=True, blank=True)
+    name = models.CharField(max_length=100)
     required = models.BooleanField(blank=True, default=False)
     default_value_string = models.TextField(null=True, blank=True)
     default_value_bool = models.BooleanField(default=False)
@@ -262,11 +410,12 @@ class CustomField(BaseAuditModel):
         default=list,
     )
     hide_in_ui = models.BooleanField(default=False)
+    hide_in_summary = models.BooleanField(default=False)
 
     class Meta:
         unique_together = (("model", "name"),)
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.name
 
     @staticmethod
@@ -277,12 +426,12 @@ class CustomField(BaseAuditModel):
 
     @property
     def default_value(self):
-        if self.type == "multiple":
+        if self.type == CustomFieldType.MULTIPLE:
             return self.default_values_multiple
-        elif self.type == "checkbox":
+        elif self.type == CustomFieldType.CHECKBOX:
             return self.default_value_bool
-        else:
-            return self.default_value_string
+
+        return self.default_value_string
 
     def get_or_create_field_value(self, instance):
         from agents.models import Agent, AgentCustomField
@@ -306,38 +455,47 @@ class CustomField(BaseAuditModel):
 
 
 class CodeSignToken(models.Model):
-    token = models.CharField(max_length=255, null=True, blank=True)
+    token: str = models.CharField(max_length=255, null=True, blank=True)
 
     def save(self, *args, **kwargs):
         if not self.pk and CodeSignToken.objects.exists():
             raise ValidationError("There can only be one CodeSignToken instance")
 
-        super(CodeSignToken, self).save(*args, **kwargs)
+        super().save(*args, **kwargs)
 
     @property
     def is_valid(self) -> bool:
         if not self.token:
             return False
 
-        errors = []
-        for url in settings.EXE_GEN_URLS:
-            try:
-                r = requests.post(
-                    f"{url}/api/v1/checktoken",
-                    json={"token": self.token},
-                    headers={"Content-type": "application/json"},
-                    timeout=15,
-                )
-            except Exception as e:
-                errors.append(str(e))
-            else:
-                errors = []
-                break
-
-        if errors:
+        try:
+            r = requests.post(
+                settings.CHECK_TOKEN_URL,
+                json={"token": self.token, "api": settings.ALLOWED_HOSTS[0]},
+                headers={"Content-type": "application/json"},
+                timeout=15,
+            )
+        except:
             return False
 
         return r.status_code == 200
+
+    @property
+    def is_expired(self) -> bool:
+        if not self.token:
+            return False
+
+        try:
+            r = requests.post(
+                settings.CHECK_TOKEN_URL,
+                json={"token": self.token, "api": settings.ALLOWED_HOSTS[0]},
+                headers={"Content-type": "application/json"},
+                timeout=15,
+            )
+        except:
+            return False
+
+        return r.status_code == 401
 
     def __str__(self):
         return "Code signing token"
@@ -358,9 +516,19 @@ class GlobalKVStore(BaseAuditModel):
 
 
 class URLAction(BaseAuditModel):
-    name = models.CharField(max_length=25)
-    desc = models.CharField(max_length=100, null=True, blank=True)
+    name = models.CharField(max_length=255)
+    desc = models.TextField(null=True, blank=True)
     pattern = models.TextField()
+    action_type = models.CharField(
+        max_length=10, choices=URLActionType.choices, default=URLActionType.WEB
+    )
+    rest_method = models.CharField(
+        max_length=10,
+        choices=URLActionRestMethod.choices,
+        default=URLActionRestMethod.POST,
+    )
+    rest_body = models.TextField(null=True, blank=True, default="")
+    rest_headers = models.TextField(null=True, blank=True, default="")
 
     def __str__(self):
         return self.name
@@ -372,46 +540,54 @@ class URLAction(BaseAuditModel):
         return URLActionSerializer(action).data
 
 
-RUN_ON_CHOICES = (
-    ("client", "Client"),
-    ("site", "Site"),
-    ("agent", "Agent"),
-    ("once", "Once"),
-)
-
-SCHEDULE_CHOICES = (("daily", "Daily"), ("weekly", "Weekly"), ("monthly", "Monthly"))
-
-
-""" class GlobalTask(models.Model):
-    script = models.ForeignKey(
-        "scripts.Script",
-        null=True,
+class Schedule(BaseAuditModel):
+    name = models.CharField(max_length=255)
+    run_time = models.TimeField()
+    run_time_weekdays = ArrayField(
+        base_field=models.PositiveSmallIntegerField(),
+        size=7,
         blank=True,
-        related_name="script",
-        on_delete=models.SET_NULL,
-    )
-    script_args = ArrayField(
-        models.CharField(max_length=255, null=True, blank=True),
         null=True,
-        blank=True,
         default=list,
     )
-    custom_field = models.OneToOneField(
-        "core.CustomField",
-        related_name="globaltask",
-        null=True,
+
+    monthly_months_of_year = ArrayField(
+        base_field=models.PositiveSmallIntegerField(),
+        size=12,
         blank=True,
-        on_delete=models.SET_NULL,
+        null=True,
+        default=list,
     )
-    timeout = models.PositiveIntegerField(default=120)
-    retcode = models.IntegerField(null=True, blank=True)
-    retvalue = models.TextField(null=True, blank=True)
-    stdout = models.TextField(null=True, blank=True)
-    stderr = models.TextField(null=True, blank=True)
-    execution_time = models.CharField(max_length=100, default="0.0000")
-    run_schedule = models.CharField(
-        max_length=25, choices=SCHEDULE_CHOICES, default="once"
+
+    # 1-31 days. last day of month is 32
+    monthly_days_of_month = ArrayField(
+        base_field=models.PositiveIntegerField(),
+        size=32,
+        blank=True,
+        null=True,
+        default=list,
     )
-    run_on = models.CharField(
-        max_length=25, choices=RUN_ON_CHOICES, default="once"
-    ) """
+
+    # 1st-4th weeks of month. Last week of month is 5
+    monthly_weeks_of_month = ArrayField(
+        base_field=models.PositiveSmallIntegerField(),
+        size=6,
+        blank=True,
+        null=True,
+        default=list,
+    )
+    schedule_type = models.CharField(
+        max_length=15, choices=ScheduleType.choices, default=ScheduleType.WEEKLY
+    )
+    monthly_type = models.CharField(
+        max_length=15, choices=MonthlyType.choices, default=MonthlyType.DAYS
+    )
+
+    def __str__(self) -> str:
+        return self.name
+
+    @staticmethod
+    def serialize(schedule):
+        from .serializers import ScheduleAuditSerializer
+
+        return ScheduleAuditSerializer(schedule).data

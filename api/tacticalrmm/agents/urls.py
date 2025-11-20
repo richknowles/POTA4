@@ -1,9 +1,10 @@
 from django.urls import path
 
-from . import views
-from checks.views import GetAddChecks
 from autotasks.views import GetAddAutoTasks
+from checks.views import GetAddChecks
 from logs.views import PendingActions
+
+from . import views
 
 urlpatterns = [
     # agent views
@@ -14,6 +15,7 @@ urlpatterns = [
     path("<agent:agent_id>/wmi/", views.WMI.as_view()),
     path("<agent:agent_id>/recover/", views.recover),
     path("<agent:agent_id>/reboot/", views.Reboot.as_view()),
+    path("<agent:agent_id>/shutdown/", views.Shutdown.as_view()),
     path("<agent:agent_id>/ping/", views.ping),
     # alias for checks get view
     path("<agent:agent_id>/checks/", GetAddChecks.as_view()),
@@ -23,6 +25,7 @@ urlpatterns = [
     path("<agent:agent_id>/pendingactions/", PendingActions.as_view()),
     # agent remote background
     path("<agent:agent_id>/meshcentral/", views.AgentMeshCentral.as_view()),
+    path("<agent:agent_id>/<str:port>/webvnc/", views.WebVNC.as_view()),
     path("<agent:agent_id>/meshcentral/recover/", views.AgentMeshCentral.as_view()),
     path("<agent:agent_id>/processes/", views.AgentProcesses.as_view()),
     path("<agent:agent_id>/processes/<int:pid>/", views.AgentProcesses.as_view()),
@@ -40,5 +43,7 @@ urlpatterns = [
     path("versions/", views.get_agent_versions),
     path("update/", views.update_agents),
     path("installer/", views.install_agent),
-    path("<str:arch>/getmeshexe/", views.get_mesh_exe),
+    path("bulkrecovery/", views.bulk_agent_recovery),
+    path("scripthistory/", views.ScriptRunHistory.as_view()),
+    path("<agent:agent_id>/wol/", views.wol),
 ]

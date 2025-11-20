@@ -1,10 +1,11 @@
-import os
 import subprocess
 
 import pyotp
+from django.conf import settings
 from django.core.management.base import BaseCommand
 
 from accounts.models import User
+from tacticalrmm.util_settings import get_webdomain
 
 
 class Command(BaseCommand):
@@ -21,28 +22,13 @@ class Command(BaseCommand):
             self.stdout.write(self.style.ERROR(f"User {username} doesn't exist"))
             return
 
-        domain = "Tactical RMM"
-        nginx = "/etc/nginx/sites-available/frontend.conf"
-        found = None
-        if os.path.exists(nginx):
-            try:
-                with open(nginx, "r") as f:
-                    for line in f:
-                        if "server_name" in line:
-                            found = line
-                            break
-
-                if found:
-                    rep = found.replace("server_name", "").replace(";", "")
-                    domain = "".join(rep.split())
-            except:
-                pass
-
         code = pyotp.random_base32()
         user.totp_key = code
         user.save(update_fields=["totp_key"])
 
-        url = pyotp.totp.TOTP(code).provisioning_uri(username, issuer_name=domain)
+        url = pyotp.totp.TOTP(code).provisioning_uri(
+            username, issuer_name=get_webdomain(settings.CORS_ORIGIN_WHITELIST[0])
+        )
         subprocess.run(f'qr "{url}"', shell=True)
         self.stdout.write(
             self.style.WARNING("Scan the barcode above with your authenticator app")

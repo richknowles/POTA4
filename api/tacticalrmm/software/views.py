@@ -7,18 +7,23 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from agents.models import Agent
-from logs.models import PendingAction
-from tacticalrmm.utils import notify_error
+from agents.models import Agent, AgentHistory
+from logs.models import AuditLog, PendingAction
+from tacticalrmm.constants import AgentHistoryType, PAAction
+from tacticalrmm.helpers import notify_error
 
 from .models import ChocoSoftware, InstalledSoftware
-from .permissions import SoftwarePerms
+from .permissions import SoftwarePerms, UninstallSoftwarePerms
 from .serializers import InstalledSoftwareSerializer
 
 
 @api_view(["GET"])
 def chocos(request):
-    return Response(ChocoSoftware.objects.last().chocos)
+    chocos = ChocoSoftware.objects.last()
+    if not chocos:
+        return Response({})
+
+    return Response(chocos.chocos)
 
 
 class GetSoftware(APIView):
@@ -35,17 +40,20 @@ class GetSoftware(APIView):
             except Exception:
                 return Response([])
         else:
-            software = InstalledSoftware.objects.filter_by_role(request.user)
+            software = InstalledSoftware.objects.filter_by_role(request.user)  # type: ignore
             return Response(InstalledSoftwareSerializer(software, many=True).data)
 
     # software install
     def post(self, request, agent_id):
         agent = get_object_or_404(Agent, agent_id=agent_id)
+        if agent.is_posix:
+            return notify_error(f"Not available for {agent.plat}")
+
         name = request.data["name"]
 
         action = PendingAction.objects.create(
             agent=agent,
-            action_type="chocoinstall",
+            action_type=PAAction.CHOCO_INSTALL,
             details={"name": name, "output": None, "installed": False},
         )
 
@@ -67,9 +75,11 @@ class GetSoftware(APIView):
     # refresh software list
     def put(self, request, agent_id):
         agent = get_object_or_404(Agent, agent_id=agent_id)
+        if agent.is_posix:
+            return notify_error(f"Not available for {agent.plat}")
 
         r: Any = asyncio.run(agent.nats_cmd({"func": "softwarelist"}, timeout=15))
-        if r == "timeout" or r == "natsdown":
+        if r in ("timeout", "natsdown"):
             return notify_error("Unable to contact the agent")
 
         if not InstalledSoftware.objects.filter(agent=agent).exists():
@@ -80,3 +90,50 @@ class GetSoftware(APIView):
             s.save(update_fields=["software"])
 
         return Response("ok")
+
+
+class UninstallSoftware(APIView):
+    permission_classes = [IsAuthenticated, UninstallSoftwarePerms]
+
+    def post(self, request, agent_id):
+        agent = get_object_or_404(Agent, agent_id=agent_id)
+        if agent.is_posix:
+            return notify_error(f"Not available for {agent.plat}")
+
+        name = request.data["name"]
+        uninstall_cmd = request.data["command"]
+
+        if all(i in uninstall_cmd.lower() for i in ("tacticalagent", "unins")):
+            return notify_error(
+                "The Tactical RMM Agent cannot be uninstalled from here."
+            )
+
+        data = {
+            "func": "rawcmd",
+            "timeout": request.data["timeout"],
+            "payload": {
+                "command": uninstall_cmd,
+                "shell": "cmd",
+            },
+            "run_as_user": request.data["run_as_user"],
+        }
+
+        hist = AgentHistory.objects.create(
+            agent=agent,
+            type=AgentHistoryType.CMD_RUN,
+            command=uninstall_cmd,
+            username=request.user.username[:50],
+        )
+        data["id"] = hist.pk
+
+        AuditLog.audit_raw_command(
+            username=request.user.username,
+            agent=agent,
+            cmd=uninstall_cmd,
+            shell="cmd",
+            debug_info={"ip": request._client_ip},
+        )
+
+        asyncio.run(agent.nats_cmd(data, wait=False))
+
+        return Response(f"{name} will now be uninstalled on {agent.hostname}.")

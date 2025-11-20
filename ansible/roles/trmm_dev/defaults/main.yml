@@ -1,0 +1,48 @@
+---
+user: "tactical"
+python_ver: "3.11.8"
+go_ver: "1.23.11"
+node_major: "20"
+backend_repo: "https://github.com/amidaware/tacticalrmm.git"
+frontend_repo: "https://github.com/amidaware/tacticalrmm-web.git"
+scripts_repo: "https://github.com/amidaware/community-scripts.git"
+backend_dir: "/opt/trmm"
+frontend_dir: "/opt/trmm-web"
+scripts_dir: "/opt/trmm-community-scripts"
+trmm_dir: "{{ backend_dir }}/api/tacticalrmm/tacticalrmm"
+mesh_dir: "/opt/meshcentral"
+opt_tactical: "/opt/tactical"
+assets_dir: "{{ opt_tactical }}/reporting/assets"
+schema_dir: "{{ opt_tactical }}/reporting/schemas"
+settings_file: "{{ trmm_dir }}/settings.py"
+local_settings_file: "{{ trmm_dir }}/local_settings.py"
+cert_dir: "/etc/ssl/tactical"
+fullchain_dest: "{{ cert_dir }}/fullchain.pem"
+privkey_dest: "{{ cert_dir }}/privkey.pem"
+
+base_pkgs:
+  - build-essential
+  - curl
+  - wget
+  - dirmngr
+  - gnupg
+  - openssl
+  - gcc
+  - g++
+  - make
+  - ca-certificates
+  - git
+  - jq
+  - libpango-1.0-0
+  - libpangoft2-1.0-0
+
+python_pkgs:
+  - zlib1g-dev
+  - libncurses5-dev
+  - libgdbm-dev
+  - libnss3-dev
+  - libssl-dev
+  - libreadline-dev
+  - libffi-dev
+  - libsqlite3-dev
+  - libbz2-dev

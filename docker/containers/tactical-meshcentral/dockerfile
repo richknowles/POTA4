@@ -1,4 +1,4 @@
-FROM node:14-alpine
+FROM node:20-alpine
 
 WORKDIR /home/node/app
 
@@ -10,12 +10,30 @@ SHELL ["/bin/bash", "-e", "-o", "pipefail", "-c"]
 
 COPY api/tacticalrmm/tacticalrmm/settings.py /tmp/settings.py
 
-RUN grep -o 'MESH_VER.*' /tmp/settings.py | cut -d'"' -f 2 > /tmp/MESH_VER && \
-    npm install meshcentral@$(cat /tmp/MESH_VER)
+RUN MESH_VER=$(grep -o 'MESH_VER.*' /tmp/settings.py | cut -d'"' -f 2) && \
+    cat > package.json <<EOF
+{
+  "dependencies": {
+    "archiver": "7.0.1",
+    "meshcentral": "$MESH_VER",
+    "mongodb": "4.13.0",
+    "otplib": "10.2.3",
+    "pg": "8.7.1",
+    "pgtools": "0.3.2",
+    "saslprep": "1.0.3"
+  }
+}
+EOF
+
+RUN npm install
+
+RUN chown -R node:node /home/node
 
 COPY docker/containers/tactical-meshcentral/entrypoint.sh /
 RUN chmod +x /entrypoint.sh
 
-EXPOSE 80 443
+EXPOSE 8080 4443
+
+USER node
 
 ENTRYPOINT [ "/entrypoint.sh" ] 

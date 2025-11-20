@@ -57,28 +57,235 @@ disks = [
     ],
 ]
 
-ping_success_output = """
-Pinging 8.8.8.8 with 32 bytes of data:
-Reply from 8.8.8.8: bytes=32 time=28ms TTL=116
-Reply from 8.8.8.8: bytes=32 time=26ms TTL=116
-Reply from 8.8.8.8: bytes=32 time=29ms TTL=116
-Reply from 8.8.8.8: bytes=32 time=23ms TTL=116
+disks_linux_pi = [
+    {
+        "free": "109.0 GB",
+        "used": "3.4 GB",
+        "total": "117.2 GB",
+        "device": "/dev/mmcblk0p2",
+        "fstype": "ext4",
+        "percent": 3,
+    },
+    {
+        "free": "203.8 MB",
+        "used": "48.3 MB",
+        "total": "252.0 MB",
+        "device": "/dev/mmcblk0p1",
+        "fstype": "vfat",
+        "percent": 19,
+    },
+]
 
-Ping statistics for 8.8.8.8:
-    Packets: Sent = 4, Received = 4, Lost = 0 (0% loss),
-Approximate round trip times in milli-seconds:
-    Minimum = 23ms, Maximum = 29ms, Average = 26ms
+disks_linux_deb = [
+    {
+        "free": "9.8 GB",
+        "used": "9.0 GB",
+        "total": "19.8 GB",
+        "device": "/dev/vda1",
+        "fstype": "ext4",
+        "percent": 47,
+    },
+    {
+        "free": "62.6 GB",
+        "used": "414.7 GB",
+        "total": "503.0 GB",
+        "device": "/dev/sda1",
+        "fstype": "ext4",
+        "percent": 86,
+    },
+]
+
+disks_mac = [
+    {
+        "free": "94.2 GB",
+        "used": "134.1 GB",
+        "total": "228.3 GB",
+        "device": "/dev/disk3s1s1",
+        "fstype": "apfs",
+        "percent": 58,
+    },
+    {
+        "free": "481.6 MB",
+        "used": "18.4 MB",
+        "total": "500.0 MB",
+        "device": "/dev/disk1s3",
+        "fstype": "apfs",
+        "percent": 3,
+    },
+    {
+        "free": "3.4 GB",
+        "used": "1.6 GB",
+        "total": "5.0 GB",
+        "device": "/dev/disk2s1",
+        "fstype": "apfs",
+        "percent": 32,
+    },
+    {
+        "free": "94.2 GB",
+        "used": "134.1 GB",
+        "total": "228.3 GB",
+        "device": "/dev/disk3s1",
+        "fstype": "apfs",
+        "percent": 58,
+    },
+]
+
+wmi_deb = {
+    "cpus": ["AMD Ryzen 9 3900X 12-Core Processor"],
+    "gpus": ["Cirrus Logic GD 5446"],
+    "disks": ["BUYVM SLAB SCSI HDD sda 512.0 GB", "0x1af4  virtio HDD vda 20.0 GB"],
+    "local_ips": ["203.121.23.54/24", "fd70::253:70dc:fe65:143/64"],
+    "make_model": "QEMU pc-i440fx-3.1",
+}
+
+wmi_pi = {
+    "cpus": ["ARMv7 Processor rev 5 (v7l)"],
+    "gpus": [],
+    "disks": ["MMC SSD mmcblk0 119.4 GB"],
+    "local_ips": ["192.168.33.10/24", "fe10::3332:4hgr:9634:1097/64"],
+    "make_model": "Raspberry Pi 2 Model B Rev 1.1",
+}
+
+wmi_mac = {
+    "cpus": ["Apple M1"],
+    "gpus": [],
+    "disks": [
+        "Apple APPLE SSD AP0256Q SCSI SSD disk0 233.8 GB",
+        "Apple APPLE SSD AP0256Q SCSI SSD disk1 500.0 MB",
+        "Apple APPLE SSD AP0256Q SCSI SSD disk2 5.0 GB",
+        "Apple APPLE SSD AP0256Q SCSI SSD disk3 228.3 GB",
+    ],
+    "local_ips": [
+        "192.168.45.113/24",
+        "fe80::476:c390:c8dc:11af/64",
+    ],
+    "make_model": "MacBookAir10,1",
+}
+
+check_network_loc_aware_ps1 = r"""
+$networkstatus = Get-NetConnectionProfile | Select NetworkCategory | Out-String
+
+if ($networkstatus.Contains("DomainAuthenticated")) {
+    exit 0
+} else {
+    exit 1
+}
+"""
+
+check_storage_pool_health_ps1 = r"""
+$pools = Get-VirtualDisk | select -ExpandProperty HealthStatus
+
+$err = $False
+
+ForEach ($pool in $pools) {
+    if ($pool -ne "Healthy") {
+        $err = $True
+    }
+}
+
+if ($err) {
+    exit 1
+} else {
+    exit 0
+}
+"""
+
+clear_print_spool_bat = r"""
+@echo off
+
+net stop spooler
+
+del C:\Windows\System32\spool\printers\* /Q /F /S
+
+net start spooler
+"""
+
+restart_nla_ps1 = r"""
+Restart-Service NlaSvc -Force
+"""
+
+show_temp_dir_py = r"""
+#!/usr/bin/python3
+
+import os
+
+temp_dir = "C:\\Windows\\Temp"
+files = []
+total = 0
+
+with os.scandir(temp_dir) as it:
+    for f in it:
+        file = {}
+        if not f.name.startswith(".") and f.is_file():
+
+            total += 1
+            stats = f.stat()
+
+            file["name"] = f.name
+            file["size"] = stats.st_size
+            file["mtime"] = stats.st_mtime
+
+            files.append(file)
+
+    print(f"Total files: {total}\n")
+
+    for file in files:
+        print(file)
+
+"""
+
+redhat_insights = r"""
+#!/bin/bash
+
+# poor man’s red hat insights
+
+# this script mimics what ansible does with red hat insights
+# pass it a file containing all RHSA’s you want to patch, one per line
+# it concatenates the advisories into a single yum command
+
+if [ $# -eq 0 ]
+then
+  echo "Usage:  $0 <SRCFILE>"
+  exit 1
+fi
+
+DT=$(date '+%m%d%Y%H%M')
+
+SRCFILE=$1
+
+for i in $(cat $SRCFILE)
+do
+  ARGS+=" --advisory $i"
+done
+
+CHECK="yum check-update -q"
+CMD_CHECK="${CHECK}${ARGS}"
+
+eval ${CMD_CHECK} >> /var/tmp/patch-$(hostname)-${DT}.output 2>&1
+
+if [ $? -eq 100 ]; then
+  UPDATE="yum update -d 2 -y"
+  CMD_UPDATE="${UPDATE}${ARGS}"
+  eval ${CMD_UPDATE} >> /var/tmp/patch-$(hostname)-${DT}.output 2>&1
+else
+  echo "error: exit code must be 100. fix yum errors and try again"
+fi
+"""
+
+ping_success_output = """
+556 bytes from 8.8.8.8: icmp_seq=0 time=2.1953ms
+556 bytes from 8.8.8.8: icmp_seq=1 time=726.1µs
+556 bytes from 8.8.8.8: icmp_seq=2 time=504.4µs
+
+--- 8.8.8.8 ping statistics ---
+3 packets transmitted, 3 packets received, 0% packet loss
+round-trip min/avg/max/stddev = 504.4µs/1.141934ms/2.1953ms/750.321µs
 """
 
 ping_fail_output = """
-Pinging 10.42.33.2 with 32 bytes of data:
-Request timed out.
-Request timed out.
-Request timed out.
-Request timed out.
-
-Ping statistics for 10.42.33.2:
-Packets: Sent = 4, Received = 0, Lost = 4 (100% loss),
+--- 10.42.33.2 ping statistics ---
+3 packets transmitted, 0 packets received, 100% packet loss
+round-trip min/avg/max/stddev = 0s/0s/0s/0s
 """
 
 spooler_stdout = """
