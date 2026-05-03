@@ -185,7 +185,7 @@ def reload_nats() -> None:
     ]
     agents = Agent.objects.prefetch_related("user").only(
         "pk", "agent_id"
-    )  # type:ignore
+    )  # type: ignore
     for agent in agents:
         try:
             users.append(
@@ -193,8 +193,13 @@ def reload_nats() -> None:
                     "user": agent.agent_id,
                     "password": agent.user.auth_token.key,
                     "permissions": {
-                        "publish": {"allow": agent.agent_id},
-                        "subscribe": {"allow": agent.agent_id},
+                        "publish": {
+                            "allow": [
+                                f"{agent.agent_id}",
+                                f"{agent.agent_id}.cmdoutput.>",
+                            ]
+                        },
+                        "subscribe": {"allow": [f"{agent.agent_id}"]},
                         "allow_responses": {
                             "expires": getattr(
                                 settings, "NATS_ALLOW_RESPONSE_EXPIRATION", "1435m"
@@ -387,7 +392,7 @@ def get_db_value(
 
 
 def replace_arg_db_values(
-    string: str, instance=None, shell: str = None, quotes=True  # type:ignore
+    string: str, instance=None, shell: str = None, quotes=True  # type: ignore
 ) -> Union[str, None]:
     # resolve the value
     value = get_db_value(string=string, instance=instance)

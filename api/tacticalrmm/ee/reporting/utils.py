@@ -27,7 +27,8 @@ import yaml
 from django.apps import apps
 from django.conf import settings
 from django.utils import timezone as djangotime
-from jinja2 import Environment, FunctionLoader
+from jinja2 import FunctionLoader
+from jinja2.sandbox import SandboxedEnvironment
 from jinja2.exceptions import TemplateError
 from rest_framework.serializers import ValidationError
 from weasyprint import CSS, HTML
@@ -79,7 +80,7 @@ def db_template_loader(template_name: str) -> Optional[str]:
 
 # sets up Jinja environment wiht the db loader template
 # comment tags needed to be editted because they conflicted with css properties
-env = Environment(
+env = SandboxedEnvironment(
     loader=FunctionLoader(db_template_loader),
     comment_start_string="{=",
     comment_end_string="=}",

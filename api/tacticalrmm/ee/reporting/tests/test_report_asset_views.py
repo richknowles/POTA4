@@ -110,10 +110,17 @@ class TestGetReportAssets:
 
 @pytest.mark.django_db
 class TestGetAllAssets:
+    @patch("ee.reporting.views.report_assets_fs")
     @patch("ee.reporting.views.os.walk")
-    def test_general_functionality(self, mock_os_walk, authenticated_client):
+    def test_general_functionality(self, mock_os_walk, mock_fs, authenticated_client):
+        fake_base_path = "/opt/tactical/reporting/assets"
+        mock_fs.base_location = fake_base_path
+
         mock_os_walk.return_value = iter(
-            [(".", ["subdir"], ["file1.txt"]), ("./subdir", [], ["subdirfile.txt"])]
+            [
+                (fake_base_path, ["subdir"], ["file1.txt"]),
+                (f"{fake_base_path}/subdir", [], ["subdirfile.txt"]),
+            ]
         )
 
         asset1 = baker.make("reporting.ReportAsset", file="file1.txt")
@@ -123,7 +130,7 @@ class TestGetAllAssets:
             {
                 "type": "folder",
                 "name": "Report Assets",
-                "path": ".",
+                "path": "",
                 "children": [
                     {
                         "type": "folder",
@@ -160,10 +167,13 @@ class TestGetAllAssets:
         assert response.status_code == 200
         assert expected_data == response.data
 
-    @patch("ee.reporting.views.os.chdir", side_effect=FileNotFoundError)
-    def test_invalid_report_assets_dir(self, mock_os_walk, authenticated_client):
+    @patch("ee.reporting.views.os.walk", side_effect=FileNotFoundError)
+    @patch("ee.reporting.views.report_assets_fs")
+    def test_invalid_report_assets_dir(
+        self, mock_fs, mock_os_walk, authenticated_client
+    ):
+        mock_fs.base_location = "/tmp/does_not_exist"
         response = authenticated_client.get("/reporting/assets/all/")
-
         assert response.status_code == 400
 
     @patch("ee.reporting.views.os.walk")

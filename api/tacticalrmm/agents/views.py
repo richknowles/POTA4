@@ -7,7 +7,7 @@ from io import StringIO
 from pathlib import Path
 
 from django.conf import settings
-from django.db.models import Exists, OuterRef, Prefetch, Q
+from django.db.models import Count, Exists, OuterRef, Prefetch, Q
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone as djangotime
@@ -36,7 +36,6 @@ from tacticalrmm.constants import (
     AGENT_DEFER,
     AGENT_STATUS_OFFLINE,
     AGENT_STATUS_ONLINE,
-    AGENT_TABLE_DEFER,
     AgentHistoryType,
     AgentMonType,
     AgentPlat,
@@ -44,6 +43,7 @@ from tacticalrmm.constants import (
     DebugLogType,
     EvtLogNames,
     PAAction,
+    PAStatus,
 )
 from tacticalrmm.helpers import date_is_in_past, notify_error
 from tacticalrmm.permissions import (
@@ -61,6 +61,7 @@ from .permissions import (
     AgentHistoryPerms,
     AgentNotesPerms,
     AgentPerms,
+    AgentRegistryPerms,
     AgentWOLPerms,
     EvtLogPerms,
     InstallAgentPerms,
@@ -86,14 +87,13 @@ from .tasks import (
     run_script_email_results_task,
     send_agent_update_task,
 )
+from .utils import get_validated_agent, send_nats_command
 
 
 class GetAgents(APIView):
     permission_classes = [IsAuthenticated, AgentPerms]
 
     def get(self, request):
-        from checks.models import Check, CheckResult
-
         monitoring_type_filter = Q()
         client_site_filter = Q()
 
@@ -119,24 +119,12 @@ class GetAgents(APIView):
                 Agent.objects.filter_by_role(request.user)  # type: ignore
                 .filter(monitoring_type_filter)
                 .filter(client_site_filter)
-                .defer(*AGENT_TABLE_DEFER)
                 .select_related(
-                    "site__server_policy",
-                    "site__workstation_policy",
-                    "site__client__server_policy",
-                    "site__client__workstation_policy",
+                    "site__client",
                     "policy",
                     "alert_template",
                 )
                 .prefetch_related(
-                    Prefetch(
-                        "agentchecks",
-                        queryset=Check.objects.select_related("script"),
-                    ),
-                    Prefetch(
-                        "checkresults",
-                        queryset=CheckResult.objects.select_related("assigned_check"),
-                    ),
                     Prefetch(
                         "custom_fields",
                         queryset=AgentCustomField.objects.select_related("field"),
@@ -148,6 +136,17 @@ class GetAgents(APIView):
                             agent_id=OuterRef("pk"), action="approve", installed=False
                         )
                     ),
+                    _pending_actions_count=Count(
+                        "pendingactions",
+                        filter=Q(pendingactions__status=PAStatus.PENDING),
+                    ),
+                )
+                .defer(
+                    "services",
+                    "created_by",
+                    "created_time",
+                    "modified_by",
+                    "modified_time",
                 )
             )
             serializer = AgentTableSerializer(agents, many=True)
@@ -1299,3 +1298,258 @@ def wol(request, agent_id):
     except Exception as e:
         return notify_error(str(e))
     return Response(f"Wake-on-LAN sent to {agent.hostname}")
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated, AgentRegistryPerms])
+def browse_registry(request, agent_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    path = request.query_params.get("path", "Computer").strip()
+    if path.lower() == "computer":
+        path = "Computer"
+
+    try:
+        page = int(request.query_params.get("page", 1))
+        page_size = int(request.query_params.get("page_size", 200))
+    except ValueError:
+        return notify_error("page and page_size must be integers")
+
+    payload = {"path": path, "page": str(page), "page_size": str(page_size)}
+    r = send_nats_command(agent, "registry_browse", payload, timeout=30)
+
+    if isinstance(r, Response):
+        return r
+
+    return Response(
+        {
+            "path": r.get("path", path),
+            "subkeys": r.get("subkeys", []),
+            "values": r.get("values", []),
+            "has_more": r.get("has_more", False),
+            "page": page,
+            "page_size": page_size,
+        }
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, AgentRegistryPerms])
+def create_registry_key(request, agent_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    path = (request.data.get("path") or "").strip()
+    if not path:
+        return notify_error("Registry path is required")
+
+    payload = {"path": path}
+    r = send_nats_command(agent, "registry_create_key", payload, timeout=30)
+
+    if isinstance(r, Response):
+        return r
+
+    return Response({"status": "success", "path": path})
+
+
+@api_view(["DELETE"])
+@permission_classes([IsAuthenticated, AgentRegistryPerms])
+def delete_registry_key(request, agent_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    path = (request.query_params.get("path") or "").strip()
+    if not path:
+        return notify_error("Registry path is required")
+
+    payload = {"path": path}
+    r = send_nats_command(agent, "registry_delete_key", payload, timeout=30)
+
+    if isinstance(r, Response):
+        return r
+
+    return Response({"status": "success", "deleted_path": path})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, AgentRegistryPerms])
+def rename_registry_key(request, agent_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    old_path = (request.data.get("old_path") or "").strip()
+    new_path = (request.data.get("new_path") or "").strip()
+
+    if not old_path or not new_path:
+        return notify_error("Both 'old_path' and 'new_path' are required")
+    if old_path == new_path:
+        return notify_error("Old and new path cannot be the same")
+
+    payload = {"old_path": old_path, "new_path": new_path}
+    r = send_nats_command(agent, "registry_rename_key", payload, timeout=60)
+
+    if isinstance(r, Response):
+        return r
+
+    return Response(
+        {
+            "status": "success",
+            "old_path": old_path,
+            "new_path": new_path,
+        }
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, AgentRegistryPerms])
+def create_registry_value(request, agent_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    path = (request.data.get("path") or "").strip()
+    val_name = request.data.get("name")
+    val_type = (request.data.get("type") or "").strip().upper()
+    val_data = request.data.get("data")
+
+    if not path:
+        return notify_error("Registry path is required")
+    if not val_type:
+        return notify_error("Registry value type is required")
+    if not val_name:
+        return notify_error("Registry value name is required")
+
+    payload = {
+        "path": path,
+        "type": val_type,
+        "name": val_name,
+        "data": val_data,
+    }
+
+    r = send_nats_command(agent, "registry_create_value", payload, timeout=30)
+
+    if isinstance(r, Response):
+        return r
+
+    return Response(
+        {
+            "status": "success",
+            "data": {
+                "name": r.get("name", val_name),
+                "type": r.get("type", val_type),
+                "data": r.get("data", val_data),
+            },
+        }
+    )
+
+
+@api_view(["DELETE"])
+@permission_classes([IsAuthenticated, AgentRegistryPerms])
+def delete_registry_value(request, agent_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    path = (request.query_params.get("path") or "").strip()
+    val_name = request.query_params.get("name")
+
+    if not path:
+        return notify_error("Registry path is required")
+    if not val_name:
+        return notify_error("Registry value name is required")
+
+    payload = {"path": path, "name": val_name}
+    r = send_nats_command(agent, "registry_delete_value", payload, timeout=30)
+
+    if isinstance(r, Response):
+        return r
+
+    return Response({"status": "success", "name": val_name})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, AgentRegistryPerms])
+def rename_registry_value(request, agent_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    path = (request.data.get("path") or "").strip()
+    old_name = request.data.get("old_name")
+    new_name = request.data.get("new_name")
+
+    if not path:
+        return notify_error("Registry path is required")
+    if not old_name:
+        return notify_error("Old value name is required")
+    if not new_name:
+        return notify_error("New value name is required")
+    if old_name == new_name:
+        return notify_error("Old and new value names cannot be the same")
+
+    payload = {
+        "path": path,
+        "old_name": old_name,
+        "new_name": new_name,
+    }
+
+    r = send_nats_command(agent, "registry_rename_value", payload, timeout=30)
+
+    if isinstance(r, Response):
+        return r
+
+    return Response(
+        {
+            "status": "success",
+            "old_name": old_name,
+            "new_name": r.get("new_name", new_name),
+        }
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, AgentRegistryPerms])
+def modify_registry_value(request, agent_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    path = (request.data.get("path") or "").strip()
+    val_name = request.data.get("name")
+    val_type = (request.data.get("type") or "").strip().upper()
+    val_data = request.data.get("data")
+
+    if not path:
+        return notify_error("Registry path is required")
+    if not val_name:
+        return notify_error("Registry value name is required")
+    if not val_type:
+        return notify_error("Registry value type is required")
+
+    payload = {
+        "path": path,
+        "name": val_name,
+        "type": val_type,
+        "data": val_data,
+    }
+
+    r = send_nats_command(agent, "registry_modify_value", payload, timeout=30)
+
+    if isinstance(r, Response):
+        return r
+
+    return Response(
+        {
+            "status": "success",
+            "data": {
+                "name": r.get("name", val_name),
+                "type": r.get("type", val_type),
+                "data": r.get("data", val_data),
+            },
+        }
+    )

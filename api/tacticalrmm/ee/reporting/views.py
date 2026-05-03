@@ -200,7 +200,7 @@ class EmailReport(APIView):
 
 
 class GenerateReportPreview(APIView):
-    permission_classes = [IsAuthenticated, GenerateReportPerms]
+    permission_classes = [IsAuthenticated, ReportingPerms]
 
     class InputRequest:
         template_md: str
@@ -559,12 +559,17 @@ class GetAllowedValues(APIView):
         return items
 
 
+TEMPLATE_REPO = (
+    "https://raw.githubusercontent.com/amidaware/reporting-templates/master/"
+)
+
+
 class SharedTemplatesRepo(APIView):
     permission_classes = [IsAuthenticated, ReportingPerms]
 
     def get(self, request: Request) -> Response:
         try:
-            url = "https://raw.githubusercontent.com/amidaware/reporting-templates/master/index.json"
+            url = f"{TEMPLATE_REPO}index.json"
             response = requests.get(url, timeout=15)
             files = response.json()
             return Response(
@@ -587,7 +592,11 @@ class SharedTemplatesRepo(APIView):
 
         try:
             for template in templates:
-                response = requests.get(template["url"], timeout=10)
+                template_url = template.get("url")
+                if not template_url or not template_url.startswith(TEMPLATE_REPO):
+                    return notify_error("Invalid template")
+
+                response = requests.get(template_url, timeout=10)
                 template_obj = response.json()
 
                 # import base template if exists
@@ -661,8 +670,8 @@ class GetAllAssets(APIView):
         only_folders = True if only_folders and only_folders == "true" else False
 
         try:
-            os.chdir(report_assets_fs.base_location)
-            response = [self._walk_folder_and_return_node(".", only_folders)]
+            base_loc = str(report_assets_fs.base_location)
+            response = [self._walk_folder_and_return_node(base_loc, only_folders)]
             return Response(response)
         except FileNotFoundError:
             return notify_error("Unable to process request")
@@ -671,39 +680,51 @@ class GetAllAssets(APIView):
     def _walk_folder_and_return_node(self, path: str, only_folders: bool = False):
         # pull report assets from the database so we can pair with the file system assets
         assets = ReportAsset.objects.all()
+        base_root = str(report_assets_fs.base_location)
 
         for current_dir, subdirs, files in os.walk(path):
-            current_dir = "Report Assets" if current_dir == "." else current_dir
+            # if current dir is base, rel path is "." else subfolder
+            rel_path = os.path.relpath(current_dir, base_root)
+
+            if rel_path == ".":
+                display_name = "Report Assets"
+                clean_path = ""
+            else:
+                display_name = os.path.basename(current_dir)
+                clean_path = rel_path
+
             node = {
                 "type": "folder",
-                "name": current_dir.replace("./", ""),
-                "path": path.replace("./", ""),
+                "name": display_name,
+                "path": clean_path,
                 "children": [],
                 "selectable": False,
                 "icon": "folder",
                 "iconColor": "yellow-9",
             }
+
             for dirname in subdirs:
-                dirpath = f"{path}/{dirname}"
+                dirpath = os.path.join(current_dir, dirname)
                 node["children"].append(
-                    # recursively call
                     self._walk_folder_and_return_node(dirpath, only_folders)
                 )
 
             if not only_folders:
                 for filename in files:
-                    path = f"{current_dir}/{filename}".replace("./", "").replace(
-                        "Report Assets/", ""
+                    file_rel_path = (
+                        filename
+                        if rel_path == "."
+                        else os.path.join(rel_path, filename)
                     )
+
                     try:
-                        # need to remove the relative path
-                        id = assets.get(file=path).id
+                        id = assets.get(file=file_rel_path).id
                         node["children"].append(
                             {
                                 "id": id,
                                 "type": "file",
                                 "name": filename,
-                                "path": path,
+                                "path": file_rel_path,
                                 "icon": "description",
                             }
                         )

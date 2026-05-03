@@ -108,6 +108,7 @@ def version(request):
 
 
 @api_view()
+@permission_classes([IsAuthenticated, ServerMaintPerms])
 def clear_cache(request):
     from core.utils import clear_entire_cache
 
@@ -117,6 +118,9 @@ def clear_cache(request):
 
 @api_view()
 def dashboard_info(request):
+    if request.user.is_installer_user:
+        return notify_error("")
+
     from core.utils import token_is_expired
     from tacticalrmm.utils import get_latest_trmm_ver, runcmd_placeholder_text
 

@@ -21,6 +21,7 @@ class MeshAgentIdent(Enum):
 CORESETTINGS_CACHE_KEY = "core_settings"
 ROLE_CACHE_PREFIX = "role_"
 AGENT_TBL_PEND_ACTION_CNT_CACHE_PREFIX = "agent_tbl_pendingactions_"
+AGENT_CHECKS_CACHE_PREFIX = "agent_checks_data_"
 
 AGENT_STATUS_ONLINE = "online"
 AGENT_STATUS_OFFLINE = "offline"
@@ -32,6 +33,7 @@ SYNC_SCHED_TASK_LOCK = "sync-sched-tasks-lock-key"
 AGENT_OUTAGES_LOCK = "agent-outages-task-lock-key"
 ORPHANED_WIN_TASK_LOCK = "orphaned-win-task-lock-key"
 SYNC_MESH_PERMS_TASK_LOCK = "sync-mesh-perms-lock-key"
+CACHE_DB_FIELDS_TASK_LOCK = "cache-db-fields-task-lock-key"
 
 TRMM_WS_MAX_SIZE = getattr(settings, "TRMM_WS_MAX_SIZE", 100 * 2**20)
 TRMM_MAX_REQUEST_SIZE = getattr(settings, "TRMM_MAX_REQUEST_SIZE", 10 * 2**20)
@@ -499,6 +501,15 @@ DEMO_NOT_ALLOWED = [
     {"name": "GetAddAPIKeys", "methods": ["POST"]},
     {"name": "GetUpdateDeleteAPIKey", "methods": ["PUT", "DELETE"]},
     {"name": "WebVNC", "methods": ["GET"]},
+    {"name": "UninstallSoftware", "methods": ["POST"]},
+    {"name": "browse_registry", "methods": ["GET"]},
+    {"name": "create_registry_key", "methods": ["POST"]},
+    {"name": "delete_registry_key", "methods": ["DELETE"]},
+    {"name": "rename_registry_key", "methods": ["POST"]},
+    {"name": "create_registry_value", "methods": ["POST"]},
+    {"name": "delete_registry_value", "methods": ["DELETE"]},
+    {"name": "rename_registry_value", "methods": ["POST"]},
+    {"name": "modify_registry_value", "methods": ["POST"]},
 ]
 
 CONFIG_MGMT_CMDS = (

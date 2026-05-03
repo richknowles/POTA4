@@ -276,9 +276,13 @@ class AutomatedTask(BaseAuditModel):
                 self.remove_if_not_scheduled if self.expire_date else False
             ),
             "start_when_available": (
-                self.run_asap_after_missed
-                if self.task_type != TaskType.RUN_ONCE
-                else True
+                False
+                if self.task_type == TaskType.MANUAL
+                else (
+                    True
+                    if self.task_type == TaskType.RUN_ONCE
+                    else self.run_asap_after_missed
+                )
             ),
         }
 
@@ -532,7 +536,7 @@ class TaskResult(models.Model):
     )
 
     def __str__(self):
-        return f"{self.agent.hostname} - {self.task}"
+        return f"{self.task}"
 
     def get_or_create_alert_if_needed(
         self, alert_template: "Optional[AlertTemplate]"

@@ -20,6 +20,7 @@ Demo database resets every hour. A lot of features are disabled for obvious reas
 - Teamviewer-like remote desktop control
 - Real-time remote shell
 - Remote file browser (download and upload files)
+- Windows Registry Editor
 - Remote command and script execution (batch, powershell, python, nushell and deno scripts)
 - Event log viewer
 - Services management

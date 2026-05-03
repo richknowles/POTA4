@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union, ca
 import msgpack
 import nats
 import validators
+from channels.layers import get_channel_layer
 from django.conf import settings
 from django.contrib.postgres.fields import ArrayField
 from django.core.cache import cache
@@ -18,8 +19,7 @@ from nats.errors import TimeoutError
 from packaging import version as pyver
 from packaging.version import Version as LooseVersion
 
-from agents.utils import get_agent_url
-from checks.models import CheckResult
+from agents.utils import calculate_agent_checks, get_agent_url
 from core.models import TZ_CHOICES
 from core.utils import _b64_to_hex, get_core_settings, send_command_with_mesh
 from logs.models import BaseAuditModel, DebugLog, PendingAction
@@ -32,9 +32,6 @@ from tacticalrmm.constants import (
     AgentHistoryType,
     AgentMonType,
     AgentPlat,
-    AlertSeverity,
-    CheckStatus,
-    CheckType,
     CustomFieldType,
     DebugLogType,
     GoArch,
@@ -241,47 +238,7 @@ class Agent(BaseAuditModel):
 
     @property
     def checks(self) -> Dict[str, Any]:
-        total, passing, failing, warning, info = 0, 0, 0, 0, 0
-
-        for check in self.get_checks_with_policies(exclude_overridden=True):
-            total += 1
-            if (
-                not hasattr(check.check_result, "status")
-                or isinstance(check.check_result, CheckResult)
-                and check.check_result.status == CheckStatus.PASSING
-            ):
-                passing += 1
-            elif (
-                isinstance(check.check_result, CheckResult)
-                and check.check_result.status == CheckStatus.FAILING
-            ):
-                alert_severity = (
-                    check.check_result.alert_severity
-                    if check.check_type
-                    in (
-                        CheckType.MEMORY,
-                        CheckType.CPU_LOAD,
-                        CheckType.DISK_SPACE,
-                        CheckType.SCRIPT,
-                    )
-                    else check.alert_severity
-                )
-                if alert_severity == AlertSeverity.ERROR:
-                    failing += 1
-                elif alert_severity == AlertSeverity.WARNING:
-                    warning += 1
-                elif alert_severity == AlertSeverity.INFO:
-                    info += 1
-
-        ret = {
-            "total": total,
-            "passing": passing,
-            "failing": failing,
-            "warning": warning,
-            "info": info,
-            "has_failing_checks": failing > 0 or warning > 0,
-        }
-        return ret
+        return calculate_agent_checks(self)
 
     @property
     def pending_actions_count(self) -> int:
@@ -886,6 +843,121 @@ class Agent(BaseAuditModel):
             await nc.publish(self.agent_id, msgpack.dumps(data))
             await nc.flush()
             await nc.close()
+
+    async def nats_stream_cmd(
+        self,
+        data: dict,
+        timeout: int = 30,
+        stop_evt: asyncio.Event | None = None,
+        output_subject: str = "",
+        group: str = "",
+    ) -> None:
+        """
+        Publish a command to the agent's NATS subject and stream back line-by-line output.
+        Improvements:
+          - Robust error handling around publish/flush/subscribe (3)
+          - Properly cancel pending waiter after asyncio.wait (2)
+          - Structured logging instead of print (4)
+          - Accept non-string payloads (dict with {line, done, exit_code}) (5)
+          - Include cmd_id in WebSocket messages for frontend filtering (6)
+        """
+        opts = setup_nats_options()
+        channel_layer = get_channel_layer()
+        cmd_id = data.get("payload", {}).get("cmd_id", "")
+
+        try:
+            nc = await nats.connect(**opts)
+        except Exception as e:
+            logger.exception("NATS connect failed for agent %s", self.agent_id)
+            await channel_layer.group_send(
+                group,
+                {
+                    "type": "stream_output",
+                    "cmd_id": cmd_id,
+                    "output": f"[ERROR] Could not connect to NATS: {e}",
+                },
+            )
+            return
+
+        async def message_handler(msg):
+            try:
+                obj = msgpack.loads(msg.data)
+                payload: dict[str, object] = {"cmd_id": cmd_id}
+                if isinstance(obj, str):
+                    payload["output"] = obj
+                elif isinstance(obj, dict):
+                    if isinstance(obj.get("line"), str):
+                        payload["output"] = obj["line"]
+                    if obj.get("done") is True:
+                        payload["done"] = True
+                    if "exit_code" in obj:
+                        payload["exit_code"] = obj["exit_code"]
+                else:
+                    payload["output"] = str(obj)
+                await channel_layer.group_send(
+                    group, {"type": "stream_output", **payload}
+                )
+            except Exception as e:
+                logger.exception(
+                    "Error handling NATS message for agent %s", self.agent_id
+                )
+                await channel_layer.group_send(
+                    group,
+                    {
+                        "type": "stream_output",
+                        "cmd_id": cmd_id,
+                        "output": f"[ERROR] {e}",
+                    },
+                )
+
+        sub = None
+        try:
+            await nc.publish(self.agent_id, msgpack.dumps(data))
+            await nc.flush()
+            sub = await nc.subscribe(output_subject, cb=message_handler)
+        except Exception as e:
+            logger.exception(
+                "NATS publish/subscribe failed for agent %s", self.agent_id
+            )
+            await channel_layer.group_send(
+                group,
+                {
+                    "type": "stream_output",
+                    "cmd_id": cmd_id,
+                    "output": f"[ERROR] NATS publish/subscribe failed: {e}",
+                },
+            )
+            try:
+                await nc.close()
+            except Exception:
+                pass
+            return
+
+        try:
+            if stop_evt is None:
+                await asyncio.sleep(timeout)
+            else:
+                waiter_stop = asyncio.create_task(stop_evt.wait())
+                waiter_sleep = asyncio.create_task(asyncio.sleep(timeout))
+                done, pending = await asyncio.wait(
+                    {waiter_stop, waiter_sleep}, return_when=asyncio.FIRST_COMPLETED
+                )
+                for p in pending:
+                    p.cancel()
+        finally:
+            try:
+                if sub is not None:
+                    await sub.unsubscribe()
+            except Exception:
+                logger.debug(
+                    "NATS unsubscribe failed for agent %s", self.agent_id, exc_info=True
+                )
+            try:
+                await nc.close()
+            except Exception:
+                logger.debug(
+                    "NATS close failed for agent %s", self.agent_id, exc_info=True
+                )
 
     def recover(self, mode: str, mesh_uri: str, wait: bool = True) -> tuple[str, bool]:
         """
